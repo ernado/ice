@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"math/rand"
 	"net"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,18 +33,6 @@ const (
 
 	stunAttrHeaderLength = 4
 )
-
-type candidatePairs []*candidatePair
-
-func (cp candidatePairs) Len() int      { return len(cp) }
-func (cp candidatePairs) Swap(i, j int) { cp[i], cp[j] = cp[j], cp[i] }
-
-type byPairPriority struct{ candidatePairs }
-
-// NB: Reverse sort so our candidates start at highest priority
-func (bp byPairPriority) Less(i, j int) bool {
-	return bp.candidatePairs[i].Priority() > bp.candidatePairs[j].Priority()
-}
 
 type bindingRequest struct {
 	transactionID  []byte
@@ -77,6 +64,9 @@ type Agent struct {
 	haveStarted   atomic.Value
 	isControlling bool
 
+	maxBindingRequests     uint16
+	checkCandidatesTimeout time.Duration
+
 	portmin uint16
 	portmax uint16
 
@@ -99,9 +89,9 @@ type Agent struct {
 	remotePwd        string
 	remoteCandidates map[NetworkType][]*Candidate
 
+	checklist    []*candidatePair
 	selector     pairCandidateSelector
 	selectedPair *candidatePair
-	validPairs   []*candidatePair
 
 	buffer *packetio.Buffer
 
@@ -160,6 +150,16 @@ type AgentConfig struct {
 	// task loop handles things like sending keepAlives. This is only value for testing
 	// keepAlive behavior should be modified with KeepaliveInterval and ConnectionTimeout
 	taskLoopInterval time.Duration
+
+	// MaxBindingRequests is the max amount of binding requests the agent will send
+	// over a candidate pair for validation or nomination, if after MaxBindingRequests
+	// the candidate is yet to answer a binding request or a nomination we set the pair as failed
+	MaxBindingRequests uint16
+
+	// CheckCandidatesTimeout specify a timeout for checking candidates, if no nomination has happen
+	// before this timeout, once hit we will nominate the best valid candidate available,
+	// or mark the connection as failed if no valid candidate is available
+	CheckCandidatesTimeout time.Duration
 }
 
 // NewAgent creates a new Agent
@@ -194,6 +194,16 @@ func NewAgent(config *AgentConfig) (*Agent, error) {
 		forceCandidateContact: make(chan bool, 1),
 	}
 	a.haveStarted.Store(false)
+
+	a.maxBindingRequests = config.MaxBindingRequests
+	if a.maxBindingRequests == 0 {
+		a.maxBindingRequests = 7
+	}
+
+	a.checkCandidatesTimeout = config.CheckCandidatesTimeout
+	if a.checkCandidatesTimeout.Nanoseconds() == 0 {
+		a.checkCandidatesTimeout = 1 * time.Second
+	}
 
 	// Make sure the buffer doesn't grow indefinitely.
 	// NOTE: We actually won't get anywhere close to this limit.
@@ -265,16 +275,30 @@ func (a *Agent) startConnectivityChecks(isControlling bool, remoteUfrag, remoteP
 	a.log.Debugf("Started agent: isControlling? %t, remoteUfrag: %q, remotePwd: %q", isControlling, remoteUfrag, remotePwd)
 
 	return a.run(func(agent *Agent) {
+		agent.isControlling = isControlling
+		agent.remoteUfrag = remoteUfrag
+		agent.remotePwd = remotePwd
+
+		a.checklist = make([]*candidatePair, 0)
+		for networkType, localCandidates := range a.localCandidates {
+			if remoteCandidates, ok := a.remoteCandidates[networkType]; ok {
+
+				for _, localCandidate := range localCandidates {
+					for _, remoteCandidate := range remoteCandidates {
+						a.addPair(localCandidate, remoteCandidate)
+					}
+				}
+
+			}
+		}
+
 		if isControlling {
 			a.selector = &controllingSelector{agent: a, log: a.log}
 		} else {
 			a.selector = &controlledSelector{agent: a, log: a.log}
 		}
-		a.selector.Start()
 
-		agent.isControlling = isControlling
-		agent.remoteUfrag = remoteUfrag
-		agent.remotePwd = remotePwd
+		a.selector.Start()
 
 		agent.updateConnectionState(ConnectionStateChecking)
 
@@ -298,32 +322,6 @@ func (a *Agent) updateConnectionState(newState ConnectionState) {
 	}
 }
 
-func (a *Agent) findValidPair(local, remote *Candidate) *candidatePair {
-	for _, p := range a.validPairs {
-		if p.local == local && p.remote == remote {
-			return p
-		}
-	}
-	return nil
-}
-
-func (a *Agent) addValidPair(local, remote *Candidate) *candidatePair {
-	p := a.findValidPair(local, remote)
-	if p != nil {
-		a.log.Tracef("Candidate pair is already valid: %s", p)
-		return p
-	}
-
-	p = newCandidatePair(local, remote, a.isControlling)
-	a.log.Tracef("Found valid candidate pair: %s", p)
-
-	// keep track of pairs with succesfull bindings since any of them
-	// can be used for communication until the final pair is selected:
-	// https://tools.ietf.org/html/draft-ietf-ice-rfc5245bis-20#section-12
-	a.validPairs = append(a.validPairs, p)
-	return p
-}
-
 func (a *Agent) setSelectedPair(p *candidatePair) {
 	a.log.Tracef("Set selected candidate pair: %s", p)
 	// Notify when the selected pair changes
@@ -336,12 +334,68 @@ func (a *Agent) setSelectedPair(p *candidatePair) {
 	a.onConnectedOnce.Do(func() { close(a.onConnected) })
 }
 
-func (a *Agent) getBestValidPair() *candidatePair {
-	if len(a.validPairs) == 0 {
-		return nil
+func (a *Agent) pingAllCandidates() {
+	for _, p := range a.checklist {
+		if p.state != candidatePairStateChecking {
+			continue
+		}
+
+		if p.bindingRequestCount > a.maxBindingRequests {
+			a.log.Tracef("max requests for %s to %s reached, marking it as failed\n", p.local.String(),
+				p.remote.String())
+			p.state = candidatePairStateFailed
+		} else {
+			a.selector.PingCandidate(p.local, p.remote)
+			p.bindingRequestCount++
+		}
 	}
-	sort.Sort(byPairPriority{a.validPairs})
-	return a.validPairs[0]
+}
+
+func (a *Agent) getBestAvailableCandidatePair() *candidatePair {
+	var best *candidatePair
+	for _, p := range a.checklist {
+		if p.state == candidatePairStateFailed {
+			continue
+		}
+
+		if best == nil {
+			best = p
+		} else if best.Priority() < p.Priority() {
+			best = p
+		}
+	}
+	return best
+}
+
+func (a *Agent) getBestValidCandidatePair() *candidatePair {
+	var best *candidatePair
+	for _, p := range a.checklist {
+		if p.state != candidatePairStateValid {
+			continue
+		}
+
+		if best == nil {
+			best = p
+		} else if best.Priority() < p.Priority() {
+			best = p
+		}
+	}
+	return best
+}
+
+func (a *Agent) addPair(local, remote *Candidate) *candidatePair {
+	p := newCandidatePair(local, remote, a.isControlling)
+	a.checklist = append(a.checklist, p)
+	return p
+}
+
+func (a *Agent) findPair(local, remote *Candidate) *candidatePair {
+	for _, p := range a.checklist {
+		if p.local == local && p.remote == remote {
+			return p
+		}
+	}
+	return nil
 }
 
 // A task is a
@@ -418,22 +472,6 @@ func (a *Agent) checkKeepalive() {
 	if (a.keepaliveInterval != 0) &&
 		(time.Since(a.selectedPair.local.LastSent()) > a.keepaliveInterval) {
 		a.keepaliveCandidate(a.selectedPair.local, a.selectedPair.remote)
-	}
-}
-
-// pingAllCandidates sends STUN Binding Requests to all candidates
-// Note: the caller should hold the agent lock.
-func (a *Agent) pingAllCandidates() {
-	for networkType, localCandidates := range a.localCandidates {
-		if remoteCandidates, ok := a.remoteCandidates[networkType]; ok {
-
-			for _, localCandidate := range localCandidates {
-				for _, remoteCandidate := range remoteCandidates {
-					a.selector.PingCandidate(localCandidate, remoteCandidate)
-				}
-			}
-
-		}
 	}
 }
 
