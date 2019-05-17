@@ -495,6 +495,12 @@ func (a *Agent) addRemoteCandidate(c *Candidate) {
 
 	set = append(set, c)
 	a.remoteCandidates[networkType] = set
+
+	if localCandidates, ok := a.localCandidates[networkType]; ok {
+		for _, localCandidate := range localCandidates {
+			a.addPair(localCandidate, c)
+		}
+	}
 }
 
 // GetLocalCandidates returns the local candidates
